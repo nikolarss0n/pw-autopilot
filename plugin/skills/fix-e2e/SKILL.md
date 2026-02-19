@@ -54,18 +54,96 @@ Classify the root cause:
 | **TIMING_ISSUE** | Add `toBeVisible()` wait or `waitForURL()` |
 | **DATA_CHANGED** | Update assertion expected values |
 | **NAVIGATION_CHANGED** | Update `goto()` / `waitForURL()` calls |
+| **APPLICATION_BUG** | Do NOT fix the test — report the bug (go to STEP 6b) |
 
 **State your diagnosis before generating the fix code.**
 
-## STEP 6: FIX AND VERIFY
+### How to identify APPLICATION_BUG
+
+The root cause is an application bug — not a test problem — when ALL of these are true:
+- The test steps match the real user flow (no missing interactions)
+- The locators correctly target the right elements
+- The failure is caused by something the test cannot control: API 500 errors, broken backend responses, missing data from the server, unhandled JS exceptions, incorrect business logic, or UI rendering bugs
+- The same failure would happen if a human followed the exact same steps manually
+
+**Key evidence to look for:**
+- `e2e_get_network`: API calls returning 4xx/5xx that previously returned 2xx
+- `e2e_get_console`: Unhandled exceptions or error stack traces in application code
+- `e2e_get_dom_snapshot`: UI in an error/broken state despite correct test inputs
+- `e2e_get_screenshot`: Visual evidence of application error screens, spinners stuck forever, broken layouts
+
+## STEP 6a: FIX AND VERIFY (test issue)
 
 1. **Minimal changes only.** Respect existing architecture (page objects, business layers, factories).
 2. **Re-run with `e2e_run_test`** to verify.
 3. If it fails at a **different** point, that's progress — iterate from STEP 2.
+4. After the test passes, continue to **STEP 7**.
+
+## STEP 6b: APPLICATION BUG REPORT (app issue — do NOT modify the test)
+
+When the root cause is **APPLICATION_BUG**, do not touch the test code. Instead, produce a complete bug analysis.
+
+**Gather all evidence first:**
+1. Collect the failing network requests (`e2e_get_network` with `statusMin: 400`)
+2. Collect console errors (`e2e_get_console` with `type: "error"`)
+3. Get the DOM snapshot at failure point (`e2e_get_dom_snapshot`)
+4. Get the failure screenshot (`e2e_get_screenshot`)
+5. Get the full action timeline (`e2e_get_actions`) to document what the test did before failure
+
+**Then output the bug report using this exact format:**
+
+---
+
+> **🔴 APPLICATION BUG DETECTED — This is NOT a test issue**
+
+### Summary
+{One sentence: what is broken and where}
+
+### Evidence
+| Signal | Detail |
+|--------|--------|
+| **Failing API** | `{METHOD} {URL}` → {status code} {response body summary} |
+| **Console errors** | `{error message}` |
+| **DOM state** | {what the page shows at failure — error message, empty state, stuck spinner, etc.} |
+| **Screenshot** | {describe what the screenshot shows} |
+
+### Root Cause Analysis
+{2-3 sentences explaining WHY this is an application bug, not a test issue. Reference specific evidence.}
+
+### Jira Ticket — ready to copy
+
+**Title:** [BUG] {concise bug title}
+
+**Priority:** {Critical / Major / Minor — based on user impact}
+
+**Environment:** {browser from playwright config, base URL}
+
+**Description:**
+{What is broken — 1-2 sentences describing the user-facing impact}
+
+**Steps to Reproduce (manual):**
+1. Navigate to {URL}
+2. {step — written as manual user actions, not test code}
+3. {step}
+4. ...
+5. **Expected:** {what should happen}
+6. **Actual:** {what happens instead}
+
+**Technical Details:**
+- Failing endpoint: `{METHOD} {URL}` → {status}
+- Error response: `{response body or key fields}`
+- Console errors: `{error messages}`
+- Test file: `{test file path}:{line number}`
+
+**Attachments:** Failure screenshot attached (captured by E2E automation)
+
+---
+
+**IMPORTANT:** Do NOT suggest workarounds, test skips, or `test.fixme()` annotations. The test is correct — it caught a real bug. Leave it failing so CI keeps flagging the issue until the application is fixed.
 
 ## STEP 7: SAVE THE FLOW (MANDATORY — always, whether the test was already passing or just fixed)
 
-After the test passes, you **MUST** call `e2e_save_app_flow` to persist what you learned. This is not optional. A passing test with captured actions is the ground truth for what the flow looks like.
+After the test passes (STEP 6a path), you **MUST** call `e2e_save_app_flow` to persist what you learned. This is not optional. A passing test with captured actions is the ground truth for what the flow looks like.
 
 Save the flow with:
 - `flowName`: use `{feature}` for the clean-start variant (e.g. `checkout`)
@@ -80,10 +158,18 @@ If you encountered a dirty-state dialog (continue/resume), save **two** flows:
 1. The clean-start flow with a `pre_condition` like `"no draft exists"`
 2. A `{flowName}--continue-draft` variant that tests the continuation path
 
+**Skip this step for APPLICATION_BUG diagnoses** — the test didn't pass, so there's no confirmed flow to save.
+
 ## OUTPUT FORMAT
 
+### For test fixes (STEP 6a):
 1. State the **root cause** (from the table above)
 2. Explain **what changed** in the application (1-2 sentences)
 3. Show the **minimal code diff**
 4. Confirm the fix by re-running the test
 5. Show the flow that was saved
+
+### For application bugs (STEP 6b):
+1. The full **🔴 APPLICATION BUG DETECTED** report (formatted as above)
+2. The Jira ticket text — ready to copy-paste
+3. Do NOT modify the test, do NOT suggest `test.skip()` or `test.fixme()`
