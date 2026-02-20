@@ -143,22 +143,20 @@ When the root cause is **APPLICATION_BUG**, do not touch the test code. Instead,
 
 **IMPORTANT:** Do NOT suggest workarounds, test skips, or `test.fixme()` annotations. The test is correct — it caught a real bug. Leave it failing so CI keeps flagging the issue until the application is fixed.
 
-## STEP 7: SAVE THE FLOW (MANDATORY — always, whether the test was already passing or just fixed)
+## STEP 7: VERIFY THE SAVED FLOW
 
-After the test passes (STEP 6a path), you **MUST** call `e2e_save_app_flow` to persist what you learned. This is not optional. A passing test with captured actions is the ground truth for what the flow looks like.
+Flows are **auto-saved** when tests pass via `e2e_run_test`. Check the response for:
+- "Flow saved: ..." — a new flow was captured
+- "Flow updated: ..." — an existing flow was updated with new actions
+- "Flow up to date" — no changes needed
 
-Save the flow with:
-- `flowName`: use `{feature}` for the clean-start variant (e.g. `checkout`)
-- `description`: one sentence describing the user journey
-- `pre_conditions`: what state the app must be in (e.g. `["no draft exists", "user is logged in"]`)
-- `steps`: the actual UI interactions in order, as `required_actions`
-- `notes`: any edge cases or observations discovered during debugging
-- `related_flows`: link to variant flows (e.g. `["checkout--continue-draft"]`)
-- `confirmed: true`
+**After auto-save, enrich the flow manually** with `e2e_save_app_flow` if you discovered:
+- `pre_conditions` (e.g. `["no draft exists", "user is logged in"]`)
+- `notes` (edge cases, gotchas, dirty-state observations)
+- `related_flows` (link to variant flows like `["checkout--continue-draft"]`)
 
-If you encountered a dirty-state dialog (continue/resume), save **two** flows:
-1. The clean-start flow with a `pre_condition` like `"no draft exists"`
-2. A `{flowName}--continue-draft` variant that tests the continuation path
+If you encountered a dirty-state dialog (continue/resume), save a **second flow** manually:
+- A `{flowName}--continue-draft` variant that tests the continuation path
 
 **Skip this step for APPLICATION_BUG diagnoses** — the test didn't pass, so there's no confirmed flow to save.
 

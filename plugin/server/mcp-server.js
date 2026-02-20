@@ -18896,6 +18896,138 @@ function formatFlows(file) {
   }
   return lines.join("\n");
 }
+function slugify(s) {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+function normalizeTestTitle(testTitle) {
+  let t = testTitle;
+  t = t.replace(/\s*\[[\w-]+\]\s*$/, "");
+  t = t.replace(/^.*?\.spec\.\w+\s*>\s*/, "");
+  return t;
+}
+function deriveFlowName(file, testTitle) {
+  const base = path3.basename(file).replace(/\.spec\.\w+$/, "").replace(/\.\w+$/, "");
+  return `${slugify(base)}/${slugify(normalizeTestTitle(testTitle))}`;
+}
+var SKIP_METHODS = /* @__PURE__ */ new Set([
+  "waitForNavigation",
+  "waitForLoadState",
+  "waitForURL",
+  "waitForSelector",
+  "waitForTimeout",
+  "waitForFunction",
+  "waitForEvent",
+  "waitForResponse",
+  "waitForRequest",
+  "finished",
+  "close",
+  "dispose"
+]);
+function formatActionForFlow(action) {
+  if (SKIP_METHODS.has(action.method))
+    return null;
+  if (action.type === "Response" || action.type === "Request")
+    return null;
+  if (action.type === "Frame" && SKIP_METHODS.has(action.method))
+    return null;
+  if (action.title)
+    return action.title;
+  const params = action.params;
+  let paramStr = "";
+  if (params) {
+    if (typeof params === "string") {
+      paramStr = params.length > 80 ? params.slice(0, 80) + "..." : params;
+    } else if (typeof params === "object") {
+      const selector = params.selector || params.url || params.name || params.value;
+      if (typeof selector === "string") {
+        paramStr = selector.length > 80 ? selector.slice(0, 80) + "..." : selector;
+      } else {
+        const json = JSON.stringify(params);
+        paramStr = json.length > 80 ? json.slice(0, 80) + "..." : json;
+      }
+    }
+  }
+  return `${action.type}.${action.method}(${paramStr})`;
+}
+function buildFlowFromActions(test) {
+  const flowName = deriveFlowName(test.file, test.test);
+  const steps = [];
+  let currentUrl = "";
+  let currentActions = [];
+  for (const action of test.actions) {
+    const formatted = formatActionForFlow(action);
+    if (!formatted)
+      continue;
+    const url = action.pageUrl || "unknown";
+    if (url !== currentUrl && currentActions.length > 0) {
+      let stepName;
+      try {
+        stepName = currentUrl ? new URL(currentUrl).pathname : "initial";
+      } catch {
+        stepName = currentUrl || "initial";
+      }
+      steps.push({ name: stepName, required_actions: currentActions });
+      currentActions = [];
+    }
+    currentUrl = url;
+    currentActions.push(formatted);
+  }
+  if (currentActions.length > 0) {
+    let stepName;
+    try {
+      stepName = currentUrl ? new URL(currentUrl).pathname : "initial";
+    } catch {
+      stepName = currentUrl || "initial";
+    }
+    steps.push({ name: stepName, required_actions: currentActions });
+  }
+  return {
+    flowName,
+    description: `Auto-captured flow for: ${normalizeTestTitle(test.test)}`,
+    steps,
+    confirmed: true,
+    savedAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function compareFlows(existing, current) {
+  if (existing.steps.length !== current.steps.length) {
+    return { changed: true, summary: `Step count changed: ${existing.steps.length} \u2192 ${current.steps.length}` };
+  }
+  const diffs = [];
+  for (let i = 0; i < existing.steps.length; i++) {
+    const eStep = existing.steps[i];
+    const cStep = current.steps[i];
+    if (eStep.name !== cStep.name) {
+      diffs.push(`Step ${i + 1} renamed: "${eStep.name}" \u2192 "${cStep.name}"`);
+    }
+    const eActions = eStep.required_actions.join("\n");
+    const cActions = cStep.required_actions.join("\n");
+    if (eActions !== cActions) {
+      const added = cStep.required_actions.filter((a) => !eStep.required_actions.includes(a));
+      const removed = eStep.required_actions.filter((a) => !cStep.required_actions.includes(a));
+      const parts = [];
+      if (added.length)
+        parts.push(`+${added.length} actions`);
+      if (removed.length)
+        parts.push(`-${removed.length} actions`);
+      diffs.push(`Step ${i + 1} ("${cStep.name}"): ${parts.join(", ")}`);
+    }
+  }
+  if (diffs.length === 0)
+    return { changed: false, summary: "Flow is up to date" };
+  return { changed: true, summary: diffs.join("; ") };
+}
+function findFlowForTest(cwd2, file, testTitle) {
+  const flowsFile = readFlows(cwd2);
+  if (flowsFile.flows.length === 0)
+    return null;
+  const derivedName = deriveFlowName(file, testTitle);
+  const exact = flowsFile.flows.find((f) => f.flowName === derivedName);
+  if (exact)
+    return exact;
+  const baseSlug = slugify(path3.basename(file).replace(/\.spec\.\w+$/, "").replace(/\.\w+$/, ""));
+  return flowsFile.flows.find((f) => f.flowName.startsWith(baseSlug + "/")) ?? null;
+}
 
 // packages/pw-test-writer/dist/mcp/tools.js
 var toolDefs = [
@@ -19179,6 +19311,19 @@ var toolDefs = [
       type: "object",
       properties: {}
     }
+  },
+  {
+    name: "e2e_build_flows",
+    description: "Run each test individually with action capture and auto-save flows. Discovers all tests (optionally filtered by project/grep), skips tests that already have up-to-date flows, runs the rest one by one, and saves a flow for each passing test. Returns a summary of new, updated, up-to-date, and failed flows.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: 'Playwright project name to filter by (e.g. "e2e", "admin")' },
+        grep: { type: "string", description: "Filter tests by title (passed as --grep to Playwright)" },
+        force: { type: "boolean", description: "Re-run tests even if their flow is already up to date (default: false)" },
+        timeout: { type: "number", description: "Timeout in seconds per individual test (default: 60)" }
+      }
+    }
   }
 ];
 function text(t) {
@@ -19252,6 +19397,8 @@ async function handleTool(name, args, ctx) {
       return handleGetContext(ctx);
     case "e2e_discover_flows":
       return handleDiscoverFlows(ctx);
+    case "e2e_build_flows":
+      return handleBuildFlows(args, ctx);
     default:
       return error(`Unknown tool: ${name}`);
   }
@@ -19295,7 +19442,7 @@ async function handleRunTest(args, ctx) {
     if (retries > 0) {
       return text("\u26A0 `retries` is only supported when `location` is set (single-test mode). Running batch without retries.");
     }
-    const result2 = await ctx.runProject(ctx.cwd, { project, repeatEach });
+    const result2 = await ctx.runProject(ctx.cwd, { project, grep, repeatEach });
     ctx.runs.set(result2.runId, result2);
     const dir = path4.join(ctx.cwd, "test-reports");
     fs3.mkdirSync(dir, { recursive: true });
@@ -19303,9 +19450,10 @@ async function handleRunTest(args, ctx) {
     const html = buildHtmlReport(result2, ctx.cwd, ctx.sendProgress);
     const reportPath = path4.join(dir, `report-${result2.runId}.html`);
     fs3.writeFileSync(reportPath, html, "utf-8");
+    const flowCoverage = buildFlowCoverageSummary(result2, ctx.cwd);
     return text(formatBatchResults(result2, project) + `
 
-\u{1F4C4} **Report:** \`${reportPath}\``);
+\u{1F4C4} **Report:** \`${reportPath}\`` + flowCoverage);
   }
   if (retries > 0) {
     const totalRuns = retries + 1;
@@ -19314,13 +19462,13 @@ async function handleRunTest(args, ctx) {
       ctx.sendProgress?.(`Retry ${i + 1}/${totalRuns} starting...`);
       const result2 = await ctx.runTest(location, ctx.cwd, { project, grep, timeoutMs, repeatEach });
       ctx.runs.set(result2.runId, result2);
-      const firstTest = result2.tests[0];
-      const status = firstTest?.status ?? "unknown";
+      const firstTest2 = result2.tests[0];
+      const status = firstTest2?.status ?? "unknown";
       attempts.push({
         runId: result2.runId,
         status,
-        duration: firstTest?.duration ?? 0,
-        error: firstTest?.error?.slice(0, 200)
+        duration: firstTest2?.duration ?? 0,
+        error: firstTest2?.error?.slice(0, 200)
       });
       const passed = attempts.filter((a) => a.status === "passed").length;
       const failed = attempts.filter((a) => a.status === "failed").length;
@@ -19357,9 +19505,12 @@ async function handleRunTest(args, ctx) {
     }
     return text(lines2.join("\n"));
   }
+  const testFile = location.includes(":") ? location.split(":")[0] : location;
   const result = await ctx.runTest(location, ctx.cwd, { project, grep, timeoutMs, repeatEach });
   ctx.runs.set(result.runId, result);
   const lines = [`**Run ID:** \`${result.runId}\``, ""];
+  const firstTest = result.tests[0];
+  const existingFlow = firstTest ? findFlowForTest(ctx.cwd, firstTest.file, firstTest.test) : null;
   for (const test of result.tests) {
     const passed = test.status === "passed";
     const icon = passed ? "\u2705" : "\u274C";
@@ -19375,10 +19526,46 @@ async function handleRunTest(args, ctx) {
   const allPassed = result.tests.every((t) => t.status === "passed");
   if (!allPassed) {
     lines.push(`Use \`e2e_get_failure_report\` with runId \`${result.runId}\` for detailed analysis.`);
-  } else {
-    const totalActions = result.tests.reduce((sum, t) => sum + t.actions.length, 0);
-    if (totalActions > 0) {
-      lines.push(`_Tip: This passing test captured ${totalActions} actions. Consider saving the flow with \`e2e_save_app_flow\` so future debugging sessions start with full context._`);
+    if (existingFlow) {
+      lines.push("");
+      lines.push("### Expected Flow (from saved flows)");
+      lines.push(`**${existingFlow.flowName}** \u2014 ${existingFlow.description}`);
+      if (existingFlow.pre_conditions?.length) {
+        lines.push(`Pre-conditions: ${existingFlow.pre_conditions.join(", ")}`);
+      }
+      for (const step of existingFlow.steps) {
+        lines.push(`- **${step.name}:** ${step.required_actions.join(", ")}`);
+      }
+      if (existingFlow.notes?.length) {
+        lines.push(`Notes: ${existingFlow.notes.join("; ")}`);
+      }
+    }
+  } else if (firstTest && firstTest.actions.length > 0) {
+    const hasLineNumber = /:\d+$/.test(location || "");
+    const isSingleSpecFile = result.tests.length === 1 && /\.spec\.\w+/.test(firstTest.file) && hasLineNumber;
+    if (isSingleSpecFile) {
+      const autoFlow = buildFlowFromActions(firstTest);
+      if (existingFlow) {
+        const diff = compareFlows(existingFlow, autoFlow);
+        if (diff.changed) {
+          autoFlow.pre_conditions = existingFlow.pre_conditions;
+          autoFlow.notes = existingFlow.notes;
+          autoFlow.related_flows = existingFlow.related_flows;
+          if (existingFlow.description && !existingFlow.description.startsWith("Auto-captured")) {
+            autoFlow.description = existingFlow.description;
+          }
+          saveFlow(ctx.cwd, autoFlow);
+          lines.push(`\u{1F504} **Flow updated:** ${diff.summary}`);
+        } else {
+          lines.push(`\u2713 Flow up to date`);
+        }
+      } else {
+        saveFlow(ctx.cwd, autoFlow);
+        lines.push(`\u{1F4BE} **Flow saved:** \`${autoFlow.flowName}\` (${autoFlow.steps.length} steps)`);
+      }
+    } else {
+      const totalActions = result.tests.reduce((sum, t) => sum + t.actions.length, 0);
+      lines.push(`_${totalActions} actions captured across ${result.tests.length} test(s). Run individual tests with file:line to auto-save per-test flows._`);
     }
   }
   return text(lines.join("\n"));
@@ -19408,6 +19595,141 @@ function formatBatchResults(result, project) {
     lines.push("All tests passed!");
   }
   return lines.join("\n");
+}
+function buildFlowCoverageSummary(result, cwd2) {
+  const matched = result.tests.map((t) => ({ test: t, hasFlow: findFlowForTest(cwd2, t.file, t.test) !== null }));
+  const covered = matched.filter((m) => m.hasFlow);
+  const uncovered = matched.filter((m) => !m.hasFlow);
+  const lines = ["", "", `### Flow Coverage: ${covered.length}/${result.tests.length} tests have saved flows`];
+  if (uncovered.length > 0) {
+    const shown = uncovered.slice(0, 10);
+    lines.push("");
+    lines.push("Missing flows for:");
+    for (const m of shown) {
+      lines.push(`- \`${m.test.file}\` \u2014 ${m.test.test}`);
+    }
+    if (uncovered.length > 10) {
+      lines.push(`- ... and ${uncovered.length - 10} more`);
+    }
+    lines.push("");
+    lines.push("_Run individual tests with `e2e_run_test` to auto-capture their flows._");
+  }
+  return lines.join("\n");
+}
+async function handleBuildFlows(args, ctx) {
+  const project = args.project ? String(args.project) : void 0;
+  const grep = args.grep ? String(args.grep) : void 0;
+  const force = Boolean(args.force ?? false);
+  const timeoutMs = args.timeout ? Number(args.timeout) * 1e3 : 6e4;
+  ctx.sendProgress?.("Discovering tests...");
+  const files = await ctx.discoverTests(ctx.cwd, project);
+  if (files.length === 0)
+    return text("No test files found.");
+  const allTests = [];
+  for (const f of files) {
+    for (const t of f.tests) {
+      if (grep && !t.fullTitle.toLowerCase().includes(grep.toLowerCase()))
+        continue;
+      allTests.push({
+        file: f.path,
+        relFile: f.relativePath,
+        line: t.line,
+        title: t.title,
+        fullTitle: t.fullTitle,
+        location: `${f.relativePath}:${t.line}`
+      });
+    }
+  }
+  if (allTests.length === 0)
+    return text("No tests match the given filters.");
+  const toRun = [];
+  const skipped = [];
+  if (!force) {
+    for (const t of allTests) {
+      const existing = findFlowForTest(ctx.cwd, t.relFile, t.fullTitle);
+      if (existing) {
+        skipped.push(t.title);
+      } else {
+        toRun.push(t);
+      }
+    }
+  } else {
+    toRun.push(...allTests);
+  }
+  if (toRun.length === 0) {
+    return text(`All ${allTests.length} tests already have flows (${skipped.length} skipped). Use \`force: true\` to rebuild.`);
+  }
+  ctx.sendProgress?.(`Building flows: 0/${toRun.length} (${skipped.length} skipped with existing flows)`);
+  let saved = 0;
+  let updated = 0;
+  let upToDate = 0;
+  let failed = 0;
+  const failures = [];
+  for (let i = 0; i < toRun.length; i++) {
+    const t = toRun[i];
+    ctx.sendProgress?.(`Building flows: ${i}/${toRun.length} \xB7 Running: ${t.title}`);
+    try {
+      const result = await ctx.runTest(t.location, ctx.cwd, { project, timeoutMs });
+      const testEntry = result.tests[0];
+      if (!testEntry || testEntry.status !== "passed") {
+        failed++;
+        failures.push(`${t.title}: ${testEntry?.error?.slice(0, 100) || "failed"}`);
+        continue;
+      }
+      if (testEntry.actions.length === 0) {
+        failed++;
+        failures.push(`${t.title}: no actions captured`);
+        continue;
+      }
+      const autoFlow = buildFlowFromActions(testEntry);
+      const existingFlow = findFlowForTest(ctx.cwd, testEntry.file, testEntry.test);
+      if (existingFlow) {
+        const diff = compareFlows(existingFlow, autoFlow);
+        if (diff.changed) {
+          autoFlow.pre_conditions = existingFlow.pre_conditions;
+          autoFlow.notes = existingFlow.notes;
+          autoFlow.related_flows = existingFlow.related_flows;
+          if (existingFlow.description && !existingFlow.description.startsWith("Auto-captured")) {
+            autoFlow.description = existingFlow.description;
+          }
+          saveFlow(ctx.cwd, autoFlow);
+          updated++;
+        } else {
+          upToDate++;
+        }
+      } else {
+        saveFlow(ctx.cwd, autoFlow);
+        saved++;
+      }
+    } catch (err) {
+      failed++;
+      failures.push(`${t.title}: ${err?.message?.slice(0, 100) || "error"}`);
+    }
+    ctx.sendProgress?.(`Building flows: ${i + 1}/${toRun.length} \xB7 \u2705 ${saved} new, \u{1F504} ${updated} updated, \u23ED ${upToDate} unchanged, \u274C ${failed} failed`);
+  }
+  const lines = [
+    `## Flow Build Complete`,
+    "",
+    `**${toRun.length}** tests processed:`,
+    `- \u2705 **${saved}** new flows saved`,
+    `- \u{1F504} **${updated}** flows updated`,
+    `- \u23ED **${upToDate}** already up to date`,
+    `- \u274C **${failed}** failed`
+  ];
+  if (skipped.length > 0) {
+    lines.push(`- \u23E9 **${skipped.length}** skipped (existing flows)`);
+  }
+  if (failures.length > 0) {
+    lines.push("");
+    lines.push("### Failures");
+    for (const f of failures.slice(0, 20)) {
+      lines.push(`- ${f}`);
+    }
+    if (failures.length > 20) {
+      lines.push(`- ... and ${failures.length - 20} more`);
+    }
+  }
+  return text(lines.join("\n"));
 }
 async function handleGetFailureReport(args, ctx) {
   const runId = String(args.runId || "");
@@ -21165,18 +21487,35 @@ async function runTest(testLocation, cwd2, options) {
     captureEndpoint = captureServer.getEndpoint();
   } catch {
   }
+  const lastColon = testLocation.lastIndexOf(":");
+  const file = lastColon > 0 ? testLocation.substring(0, lastColon) : testLocation;
+  const lineNum = lastColon > 0 ? parseInt(testLocation.substring(lastColon + 1), 10) : NaN;
+  const relFile = path6.relative(cwd2, file);
+  let resolvedTitle;
+  if (!isNaN(lineNum)) {
+    try {
+      const discovered = await discoverTests(cwd2, options?.project);
+      for (const f of discovered) {
+        if (f.relativePath === relFile || f.path.endsWith(relFile)) {
+          const match2 = f.tests.find((t) => t.line === lineNum);
+          if (match2) {
+            resolvedTitle = match2.fullTitle;
+            break;
+          }
+        }
+      }
+    } catch {
+    }
+  }
   const startTime = Date.now();
   try {
     const spawnResult = await spawnTest(testLocation, cwd2, captureEndpoint, options?.timeoutMs, options?.project, options?.grep, options?.repeatEach, options?.onProgress);
     const duration = Date.now() - startTime;
     const attachments = collectScreenshots(cwd2, startTime);
     collectActionScreenshots(target.actions, cwd2, attachments);
-    const lastColon = testLocation.lastIndexOf(":");
-    const file = lastColon > 0 ? testLocation.substring(0, lastColon) : testLocation;
-    const relFile = path6.relative(cwd2, file);
     const entry = {
       file: relFile,
-      test: testLocation,
+      test: resolvedTitle || spawnResult.testTitle || testLocation,
       location: testLocation,
       status: spawnResult.success ? "passed" : "failed",
       duration,
@@ -21195,6 +21534,8 @@ async function runProject(cwd2, options) {
   const args = ["test"];
   if (options?.project)
     args.push("--project", options.project);
+  if (options?.grep)
+    args.push("--grep", options.grep);
   if (options?.repeatEach && options.repeatEach > 1)
     args.push("--repeat-each", String(options.repeatEach));
   args.push("--reporter=json");
@@ -21400,8 +21741,9 @@ function spawnTest(testLocation, cwd2, captureEndpoint, timeoutMs = 12e4, projec
     }, timeoutMs);
     child.on("close", (code) => {
       clearTimeout(timer);
+      const testTitle = parseTestTitleFromLineOutput(stdout);
       if (code === 0) {
-        resolve6({ success: true });
+        resolve6({ success: true, testTitle });
         return;
       }
       const combined = (stdout + "\n" + stderr).replace(/\x1B\[[0-9;]*[a-zA-Z]/g, "").replace(/\[1A|\[2K/g, "");
@@ -21425,11 +21767,11 @@ function spawnTest(testLocation, cwd2, captureEndpoint, timeoutMs = 12e4, projec
         }
       }
       if (errorLines.length > 0) {
-        resolve6({ success: false, error: errorLines.join("\n") });
+        resolve6({ success: false, error: errorLines.join("\n"), testTitle });
       } else {
         const noise = /^\d+ (passed|failed|skipped)|^Running \d|^npx |^\[.+\] ›|^reports\/|^\s*$/;
         const meaningful = lines.map((l) => l.trim()).filter((l) => l && !noise.test(l));
-        resolve6({ success: false, error: meaningful.slice(-8).join("\n") || `Exit code ${code}` });
+        resolve6({ success: false, error: meaningful.slice(-8).join("\n") || `Exit code ${code}`, testTitle });
       }
     });
     child.on("error", (err) => {
@@ -21437,6 +21779,19 @@ function spawnTest(testLocation, cwd2, captureEndpoint, timeoutMs = 12e4, projec
       resolve6({ success: false, error: err.message });
     });
   });
+}
+function parseTestTitleFromLineOutput(stdout) {
+  const clean = stdout.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, "");
+  for (const line of clean.split("\n")) {
+    const match2 = line.match(/^\s*[✓✗✔✘×]\s+\d+\s+(?:\[.+?\]\s+›\s+)?(.+)/);
+    if (match2) {
+      const parts = match2[1].split("\u203A").map((s) => s.trim());
+      if (parts.length >= 2) {
+        return parts.slice(1).join(" \u203A ");
+      }
+    }
+  }
+  return void 0;
 }
 function collectScreenshots(cwd2, startTime) {
   const attachments = [];
@@ -21498,10 +21853,10 @@ function createMcpServer(cwd2) {
 Use this server to run and debug Playwright E2E tests. Prefer these tools over running tests manually via bash.
 
 ## Workflow
-0. e2e_get_context \u2014 load stored flows + page object index (do this FIRST before debugging)
+0. e2e_get_context \u2014 load stored flows + page object index (recommended before debugging, but e2e_run_test also auto-loads the matching flow per test)
 1. e2e_list_projects \u2014 see available Playwright projects from the config
 2. e2e_list_tests \u2014 discover tests (use "project" param to filter, e.g. "e2e", "admin")
-3. e2e_run_test \u2014 run a specific test (by file:line) with action capture, or run all tests (omit location) for a pass/fail summary. Returns runId
+3. e2e_run_test \u2014 run a specific test (by file:line) with action capture, or run all tests (omit location) for a pass/fail summary. Returns runId. **Auto-loads matching flow before run and auto-saves flow on pass.**
 4. Diagnose failures using the runId:
    - e2e_get_failure_report \u2014 comprehensive error report with DOM, network, console, timeline
    - e2e_get_actions \u2014 step-by-step action timeline
@@ -21515,9 +21870,11 @@ Use this server to run and debug Playwright E2E tests. Prefer these tools over r
 5. Fix the test code, then re-run with e2e_run_test to verify
 
 ## Context Loading
-- **Always call \`e2e_get_context\` before debugging.** It returns stored application flows and a page object index in one call.
+- \`e2e_run_test\` **auto-loads** the matching flow for the test being run and includes it in the response on failure. It also **auto-saves** flows when tests pass.
+- Use \`e2e_get_context\` for full project context (all flows + page object index) \u2014 useful when you need to see the big picture.
 - Cross-reference stored flows against the test's action timeline to identify missing steps.
 - Use the page object index to find existing methods instead of writing raw Playwright calls.
+- After a batch run, check the **flow coverage summary**. Use \`e2e_build_flows\` to auto-run uncovered tests individually and save their flows.
 
 ## Flow Discovery (when no flows are stored)
 
@@ -21533,7 +21890,7 @@ When \`e2e_get_context\` returns no stored flows, you must understand the applic
 
 4. **Scan all specs.** Use \`e2e_discover_flows\` to get a draft flow map from static analysis of all spec files \u2014 this shows you how similar features are tested.
 
-5. **Save confirmed flows.** After fixing, propose the complete flow to the user with \`e2e_save_app_flow\` so future sessions start with full context.
+5. **Flows are auto-saved** when tests pass via \`e2e_run_test\`. Use \`e2e_save_app_flow\` manually to add pre_conditions, notes, or related_flows that auto-save can't infer.
 
 ## Debugging Tips
 - Start with e2e_get_failure_report for a quick overview of what went wrong
@@ -21687,7 +22044,7 @@ Combine both: use \`repeatEach: 40\` to confirm flakiness, then \`retries: 2\` t
     discoverTests: (cwd3, project) => discoverTests(cwd3, project),
     discoverProjects: (cwd3) => discoverProjects(cwd3),
     runTest: (location, cwd3, options) => runTest(location, cwd3, { project: options?.project, grep: options?.grep, timeoutMs: options?.timeoutMs, repeatEach: options?.repeatEach, onProgress: sendProgress }),
-    runProject: (cwd3, options) => runProject(cwd3, { project: options?.project, repeatEach: options?.repeatEach, onProgress: sendProgress }),
+    runProject: (cwd3, options) => runProject(cwd3, { project: options?.project, grep: options?.grep, repeatEach: options?.repeatEach, onProgress: sendProgress }),
     sendProgress
   };
   server2.setRequestHandler(ListToolsRequestSchema, async () => ({
